@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  # headless backend for Streamlit Cloud
 import matplotlib.pyplot as plt
 import streamlit as st
 
@@ -456,3 +459,4 @@ if st.button("Prepare download"):
     out_bytes = io.BytesIO()
     df.to_csv(out_bytes, index=False)
     st.download_button("Download CSV", data=out_bytes.getvalue(), file_name=fname, mime="text/csv")
+
