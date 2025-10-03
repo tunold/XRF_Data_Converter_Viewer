@@ -595,6 +595,148 @@ def attach_positions_to_df(df: pd.DataFrame, spx_dir: str) -> Tuple[pd.DataFrame
     out["Y_mm"] = Y
     return out, n_match, len(spx_df)
 
+# --- .spx from uploads ---
+def extract_axes_from_spx_bytes(name: str, data: bytes):
+    """Parse a single .spx file from bytes and return axes dict (like extract_axes_with_rtrem_fallback)."""
+    import base64, struct, xml.etree.ElementTree as ET
+    root = ET.parse(io.BytesIO(data)).getroot()
+
+    axes = {}
+    for elem in root.iter():
+        tag = elem.tag
+        if tag.startswith("Axis"):
+            nm = elem.attrib.get("AxisName", tag)
+            unit = elem.attrib.get("AxisUnit", "")
+            pos  = elem.attrib.get("AxisPosition")
+            if pos is not None:
+                try:
+                    pos_val = float(pos)
+                except ValueError:
+                    pos_val = pos
+                axes[nm] = {"position": pos_val, "unit": unit}
+    if axes:
+        return axes
+
+    # fallback: RTREM-like base64 blob scan
+    def find_xyz_from_blob(blob: bytes):
+        best = None
+        for off in range(0, len(blob) - 24 + 1):
+            try:
+                x, y, z = struct.unpack("<ddd", blob[off:off+24])
+            except struct.error:
+                continue
+            if all(0 <= v <= 1000 for v in (x, y, z)) and all(v > 0 for v in (x, y, z)):
+                best = (off, (x, y, z))
+        return None if best is None else best[1]
+
+    for data_node in root.findall(".//Data"):
+        b64 = (data_node.text or "").strip()
+        if len(b64) < 8:
+            continue
+        try:
+            blob = base64.b64decode(b64, validate=True)
+        except Exception:
+            continue
+        xyz = find_xyz_from_blob(blob)
+        if xyz:
+            x, y, z = xyz
+            return {
+                "X": {"position": float(x), "unit": "mm"},
+                "Y": {"position": float(y), "unit": "mm"},
+                "Z": {"position": float(z), "unit": "mm"},
+            }
+    return {}
+
+def collect_spx_positions_uploaded(spx_files) -> List[dict]:
+    """Read multiple UploadedFile .spx objects → list of records with X_mm,Y_mm."""
+    recs = []
+    for f in spx_files:
+        try:
+            f.seek(0)
+            data = f.read()
+            axes = extract_axes_from_spx_bytes(f.name, data)
+            recs.append({
+                "file": f.name,
+                "stem": Path(f.name).stem,
+                "X_mm": axes.get("X", {}).get("position"),
+                "Y_mm": axes.get("Y", {}).get("position"),
+                "Z_mm": axes.get("Z", {}).get("position"),
+                "unit": axes.get("X", {}).get("unit") or axes.get("Y", {}).get("unit") or axes.get("Z", {}).get("unit") or None,
+                "found_axes": bool(axes),
+            })
+        except Exception as e:
+            recs.append({
+                "file": f.name,
+                "stem": Path(f.name).stem,
+                "X_mm": None, "Y_mm": None, "Z_mm": None,
+                "unit": None,
+                "found_axes": False,
+                "error": str(e),
+            })
+    return recs
+
+def attach_positions_to_df_from_records(df: pd.DataFrame, records: List[dict]) -> Tuple[pd.DataFrame, int, int]:
+    """Attach X_mm,Y_mm to df by matching Spectrum against uploaded .spx stems."""
+    spx_df = pd.DataFrame(records)
+    spx_df = spx_df[spx_df["found_axes"] & spx_df["X_mm"].notna() & spx_df["Y_mm"].notna()].copy()
+    lut = make_spx_lookup(spx_df)  # reuses your existing helper
+
+    out = df.copy()
+    X = np.full(len(out), np.nan)
+    Y = np.full(len(out), np.nan)
+    spec = out["Spectrum"].astype(str)
+    n_match = 0
+    for i, val in enumerate(spec):
+        for k in _spectrum_keys(val):
+            if k in lut:
+                X[i], Y[i] = lut[k]
+                n_match += 1
+                break
+    out["X_mm"] = X
+    out["Y_mm"] = Y
+    # return matched count, and number of uploaded .spx with valid axes
+    return out, n_match, len(spx_df)
+
+def try_regular_grid_from_positions(x: np.ndarray, y: np.ndarray, v: np.ndarray, round_dec: int = 4):
+    """
+    If (x,y) lie on an (almost) regular grid, return (Z, xs, ys) with exact binning.
+    Otherwise return (None, None, None).
+    """
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+    x, y, v = x[valid], y[valid], v[valid]
+    if x.size < 3:
+        return None, None, None
+
+    xr = np.round(x, round_dec)
+    yr = np.round(y, round_dec)
+    xs = np.unique(xr)
+    ys = np.unique(yr)
+    nx, ny = xs.size, ys.size
+
+    # Map each sample to integer bin
+    xi = np.searchsorted(xs, xr)
+    yi = np.searchsorted(ys, yr)
+
+    # Accumulate averages in bins
+    sum_grid = np.zeros((ny, nx), dtype=float)
+    cnt_grid = np.zeros((ny, nx), dtype=int)
+    for j in range(v.size):
+        sum_grid[yi[j], xi[j]] += v[j]
+        cnt_grid[yi[j], xi[j]] += 1
+
+    filled = (cnt_grid > 0).sum()
+    # Heuristic: if ≥80% of samples hit unique bins and coverage is decent, treat as regular grid
+    unique_pairs = len(set(zip(xi.tolist(), yi.tolist())))
+    if unique_pairs >= 0.8 * v.size and filled >= 0.7 * (nx * ny):
+        Z = np.full((ny, nx), np.nan, dtype=float)
+        nz = cnt_grid > 0
+        Z[nz] = (sum_grid[nz] / cnt_grid[nz])
+        return Z, xs, ys
+
+    return None, None, None
+
+
+
 # ================================================================
 #                          STREAMLIT UI
 # ================================================================
@@ -613,7 +755,6 @@ with st.sidebar:
         index=0,
     )
 
-    # Manual grid params (used always for image resolution; for .spx used as grid resolution)
     st.header("3) Grid parameters")
     NX = st.number_input("NX (columns, x)", 1, 4000, 24)
     NY = st.number_input("NY (rows, y)", 1, 4000, 22)
@@ -636,9 +777,12 @@ with st.sidebar:
 
     if mapping_mode == "From .spx files (stage positions)":
         st.header("6) .spx positions")
-        spx_dir = st.text_input("Directory with .spx files (local path)", value="", help="Folder containing the .spx files that belong to this map.")
+        spx_files = st.file_uploader("Upload related .spx files (multi-select)", type=["spx"],
+                                     accept_multiple_files=True)
+        st.caption(
+            "No folder path needed — just drop the .spx files here. If you run locally and load by path, the app will auto-use that folder.")
     else:
-        spx_dir = ""
+        spx_files = []
 
 if up is None:
     st.info("Upload a .txt / .xls / .xlsx to begin.")
@@ -713,95 +857,107 @@ plot_col = st.selectbox("Column to plot", options=sorted(set(plot_candidates)), 
 # ---- mapping + plot ----
 vals = pd.to_numeric(df[plot_col], errors="coerce").to_numpy()
 
-if mapping_mode == "From .spx files (stage positions)" and spx_dir.strip():
-    df_pos, n_match, n_total_spx = attach_positions_to_df(df, spx_dir.strip())
-    st.caption(f".spx match: matched {n_match} spectra to positions ({n_total_spx} .spx with positions found in folder).")
-    x = df_pos["X_mm"].to_numpy(dtype=float)
-    y = df_pos["Y_mm"].to_numpy(dtype=float)
-    v = pd.to_numeric(df_pos[plot_col], errors="coerce").to_numpy(dtype=float)
+if mapping_mode == "From .spx files (stage positions)":
+    df_pos = None
+    matched = 0
+    total_valid_spx = 0
 
-    # IDW grid over measured extents, resolution NX×NY
-    Z, (xi, yi) = idw_grid(x, y, v, nx=int(NX), ny=int(NY), power=2.0)
-
-    # auto limits
-    if use_robust:
-        vmin_auto, vmax_auto = robust_minmax(Z)
+    if spx_files:
+        # Use uploaded .spx files
+        recs = collect_spx_positions_uploaded(spx_files)
+        df_pos, matched, total_valid_spx = attach_positions_to_df_from_records(df, recs)
     else:
-        finite = Z[np.isfinite(Z)]
-        vmin_auto = float(np.nanmin(finite)) if finite.size else None
-        vmax_auto = float(np.nanmax(finite)) if finite.size else None
+        # Try to auto-derive dir if user loaded by path (not via uploader)
+        # If you added a 'data_path' mode, derive dir = Path(data_path).parent here and call attach_positions_to_df(...)
+        df_pos = None
 
-    vmin_plot, vmax_plot = vmin_auto, vmax_auto
-    if manual_scale and (vmax_user > vmin_user):
-        vmin_plot, vmax_plot = float(vmin_user), float(vmax_user)
+    if df_pos is None:
+        st.warning("No .spx files provided (upload). Falling back to manual grid mapping.")
+        # ---- manual fallback
+        Z = to_grid(vals, nx=int(NX), ny=int(NY), snake=snake, flip_x=flip_x, flip_y=flip_y)
+        vmin_auto, vmax_auto = (robust_minmax(Z) if use_robust else (np.nanmin(Z), np.nanmax(Z)))
+        vmin_plot = float(vmin_user) if (manual_scale and vmax_user > vmin_user) else vmin_auto
+        vmax_plot = float(vmax_user) if (manual_scale and vmax_user > vmin_user) else vmax_auto
+        fig = plt.figure(figsize=(5, 4))
+        ax = fig.add_subplot(111)
+        im = ax.imshow(Z, origin="lower", extent=[0, NX, 0, NY],
+                       aspect="equal", interpolation="nearest", cmap=cmap,
+                       vmin=vmin_plot, vmax=vmax_plot)
+        fig.colorbar(im, ax=ax).set_label(plot_col)
+        ax.set_xlabel("x (index)"); ax.set_ylabel("y (index)")
+        ax.set_title(f"{plot_col} (row-major{' snake' if snake else ''})")
+        st.pyplot(fig, clear_figure=True)
 
-    # draw figure in physical coords (mm)
-    fig = plt.figure(figsize=(5, 4))
-    ax = fig.add_subplot(111)
-    extent = [float(xi.min()), float(xi.max()), float(yi.min()), float(yi.max())]
-    im = ax.imshow(Z, origin="lower", extent=extent, aspect="equal",
-                   interpolation="nearest", cmap=cmap, vmin=vmin_plot, vmax=vmax_plot)
-    cb = fig.colorbar(im, ax=ax)
-    cb.set_label(f"{plot_col}")
-    ax.set_xlabel("X (mm)")
-    ax.set_ylabel("Y (mm)")
-    ax.set_title(f"{plot_col} (IDW over .spx positions)")
-    st.pyplot(fig, clear_figure=True)
+    else:
+        st.caption(f".spx match: matched {matched} spectra to positions ({total_valid_spx} .spx with valid axes).")
+        x = df_pos["X_mm"].to_numpy(dtype=float)
+        y = df_pos["Y_mm"].to_numpy(dtype=float)
+        v = pd.to_numeric(df_pos[plot_col], errors="coerce").to_numpy(dtype=float)
 
-    with st.expander("Matched positions (first 20)"):
-        st.dataframe(df_pos[["Spectrum","X_mm","Y_mm"]].head(20), use_container_width=True)
+        # 1) Try exact regular grid mapping (NX/NY ignored)
+        Z, xs, ys = try_regular_grid_from_positions(x, y, v, round_dec=4)
+        if Z is not None:
+            extent = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max())]
+        else:
+            # 2) Fall back to IDW (NX/NY are only the render resolution here)
+            Z, (xs, ys) = idw_grid(x, y, v, nx=int(NX), ny=int(NY), power=2.0)
+            extent = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max())]
+
+        # limits
+        if use_robust:
+            vmin_auto, vmax_auto = robust_minmax(Z)
+        else:
+            finite = Z[np.isfinite(Z)]
+            vmin_auto = float(np.nanmin(finite)) if finite.size else None
+            vmax_auto = float(np.nanmax(finite)) if finite.size else None
+        vmin_plot = float(vmin_user) if (manual_scale and vmax_user > vmin_user) else vmin_auto
+        vmax_plot = float(vmax_user) if (manual_scale and vmax_user > vmin_user) else vmax_auto
+
+        # draw in stage coordinates (mm)
+        fig = plt.figure(figsize=(5, 4))
+        ax = fig.add_subplot(111)
+        im = ax.imshow(Z, origin="lower", extent=extent, aspect="equal",
+                       interpolation="nearest", cmap=cmap, vmin=vmin_plot, vmax=vmax_plot)
+        fig.colorbar(im, ax=ax).set_label(plot_col)
+        ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
+        title_suffix = "regular grid" if (Z is not None and xs is not None) else "IDW"
+        ax.set_title(f"{plot_col} (.spx positions, {title_suffix})")
+        st.pyplot(fig, clear_figure=True)
+
+        with st.expander("Matched positions (first 20)"):
+            st.dataframe(df_pos[["Spectrum","X_mm","Y_mm"]].head(20), use_container_width=True)
+
+    # --- prepare export (ensure X_mm/Y_mm carried) ---
+    df_export = df.copy()
+    if df_pos is not None:
+        for col in ["X_mm", "Y_mm", "Z_mm"]:
+            if col in df_pos.columns:
+                df_export[col] = df_pos[col]
 
 else:
-    # Manual grid (row-major mapping)
+    # Manual mapping branch (unchanged)
     Z = to_grid(vals, nx=int(NX), ny=int(NY), snake=snake, flip_x=flip_x, flip_y=flip_y)
-
     if use_robust:
         vmin_auto, vmax_auto = robust_minmax(Z)
     else:
         finite = Z[np.isfinite(Z)]
         vmin_auto = float(np.nanmin(finite)) if finite.size else None
         vmax_auto = float(np.nanmax(finite)) if finite.size else None
-
-    vmin_plot, vmax_plot = vmin_auto, vmax_auto
-    if manual_scale and (vmax_user > vmin_user):
-        vmin_plot, vmax_plot = float(vmin_user), float(vmax_user)
+    vmin_plot = float(vmin_user) if (manual_scale and vmax_user > vmin_user) else vmin_auto
+    vmax_plot = float(vmax_user) if (manual_scale and vmax_user > vmin_user) else vmax_auto
 
     fig = plt.figure(figsize=(5, 4))
     ax = fig.add_subplot(111)
     im = ax.imshow(Z, origin="lower", extent=[0, NX, 0, NY],
                    aspect="equal", interpolation="nearest", cmap=cmap,
                    vmin=vmin_plot, vmax=vmax_plot)
-    cb = fig.colorbar(im, ax=ax)
-    cb.set_label(plot_col)
-    ax.set_xlabel("x (index)")
-    ax.set_ylabel("y (index)")
+    fig.colorbar(im, ax=ax).set_label(plot_col)
+    ax.set_xlabel("x (index)"); ax.set_ylabel("y (index)")
     ax.set_title(f"{plot_col} (row-major{' snake' if snake else ''})")
     st.pyplot(fig, clear_figure=True)
 
-# --- decide export DataFrame (include positions if available) ---
-df_export = df.copy()
-
-if mapping_mode == "From .spx files (stage positions)" and spx_dir.strip():
-    # If we already built df_pos above, reuse it; otherwise attach now
-    if 'df_pos' in locals():
-        src = df_pos
-    else:
-        src, _, _ = attach_positions_to_df(df, spx_dir.strip())
-
-    # copy X/Y (and Z if present)
-    for col in ["X_mm", "Y_mm", "Z_mm"]:
-        if col in src.columns:
-            df_export[col] = src[col]
-else:
-    # Optional: if a directory is provided but manual mapping selected,
-    # you can still enrich the export with positions (comment out if not desired)
-    if spx_dir.strip():
-        src2, _, _ = attach_positions_to_df(df, spx_dir.strip())
-        for col in ["X_mm", "Y_mm", "Z_mm"]:
-            if col in src2.columns:
-                df_export[col] = src2[col]
-
-
+    # export
+    df_export = df.copy()
 
 
 # ---- save augmented CSV ----
